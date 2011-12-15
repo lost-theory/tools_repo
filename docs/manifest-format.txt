@@ -55,6 +55,9 @@ following DTD:
     <!ELEMENT repo-hooks (EMPTY)>
     <!ATTLIST repo-hooks in-project CDATA #REQUIRED>
     <!ATTLIST repo-hooks enabled-list CDATA #REQUIRED>
+
+    <!ELEMENT disabled-subcmds (EMPTY)>
+    <!ATTLIST disabled-subcmds subcmds CDATA #REQUIRED>
   ]>
 
 A description of the elements and their attributes follows.
@@ -168,6 +171,13 @@ replace the project with a different source.
 This element is mostly useful in the local_manifest.xml, where
 the user can remove a project, and possibly replace it with their
 own definition.
+
+Element disabled-subcmds
+------------------------
+
+Comma separated list of repo subcmds that should not be used on this
+repo. For example, you could disable the 'upload' subcmd for projects
+that do not use Gerrit.
 
 
 Local Manifest

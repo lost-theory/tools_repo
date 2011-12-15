@@ -231,6 +231,11 @@ class XmlManifest(object):
     return self._manifest_server
 
   @property
+  def disabled_subcmds(self):
+    self._Load()
+    return self._disabled_subcmds
+
+  @property
   def IsMirror(self):
     return self.manifestProject.config.GetBoolean('repo.mirror')
 
@@ -341,6 +346,11 @@ class XmlManifest(object):
               'duplicate project %s in %s' %
               (project.name, self.manifestFile))
         self._projects[project.name] = project
+
+    self._disabled_subcmds = []
+    for node in config.childNodes:
+      if node.nodeName == 'disabled-subcmds':
+            self._disabled_subcmds = self._reqatt(node, 'subcmds').split(',')
 
     for node in config.childNodes:
       if node.nodeName == 'repo-hooks':

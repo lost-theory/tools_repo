@@ -13,10 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+import os, sys
+from manifest_xml import XmlManifest
+
+#load manifest if we have one
+disabled = []
+for arg in sys.argv:
+    if arg.startswith('--repo-dir'):
+        repodir = arg.split('=')[1]
+        disabled = set(XmlManifest(repodir).disabled_subcmds)
+        break
 
 all = {}
-
 my_dir = os.path.dirname(__file__)
 for py in os.listdir(my_dir):
   if py == '__init__.py':
@@ -24,6 +32,9 @@ for py in os.listdir(my_dir):
 
   if py.endswith('.py'):
     name = py[:-3]
+
+    if name in disabled:
+      continue
 
     clsn = name.capitalize()
     while clsn.find('_') > 0:
