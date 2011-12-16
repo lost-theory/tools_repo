@@ -471,7 +471,7 @@ def _PostRepoFetch(rp, no_repo_verify=False, verbose=False):
       print >>sys.stderr, 'warning: Skipped upgrade to unverified version'
   else:
     if verbose:
-      print >>sys.stderr, 'repo version %s is current' % rp.work_git.describe(HEAD)
+      print >>sys.stderr, 'repo version %s is current' % rp.work_git.rev_parse(HEAD)
 
 def _VerifyTag(project):
   gpg_dir = os.path.expanduser('~/.repoconfig/gnupg')
