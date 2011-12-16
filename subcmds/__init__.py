@@ -21,7 +21,8 @@ disabled = []
 for arg in sys.argv:
     if arg.startswith('--repo-dir'):
         repodir = arg.split('=')[1]
-        disabled = set(XmlManifest(repodir).disabled_subcmds)
+        if os.path.exists(repodir):
+            disabled = set(XmlManifest(repodir).disabled_subcmds)
         break
 
 all = {}
