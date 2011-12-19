@@ -101,6 +101,10 @@ the following meanings:
     all = self.GetProjects(args)
     counter = itertools.count()
 
+    if not all:
+      print >>sys.stderr, "no repos checked out yet. exiting."
+      sys.exit(1)
+
     on = {}
     for project in all:
       cb = project.CurrentBranch
