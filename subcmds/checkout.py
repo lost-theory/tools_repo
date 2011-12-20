@@ -60,5 +60,22 @@ The command is equivalent to:
           % (p.relpath, nb)
       sys.exit(1)
     elif not success:
-      print >>sys.stderr, 'error: no project has branch %s' % nb
-      sys.exit(1)
+      #branch does not exist locally, check all remotes
+      print >>sys.stderr, "note: no project has local branch '%s', searching remotes..." % nb
+      for project in all:
+        rbranches = project.work_git.branch("-r")
+        rbranches = rbranches.strip().split('\n')
+        rbranches = map(lambda s: s.split('->')[0].strip(), rbranches)
+        rbranches = [b.replace('origin/', '') for b in rbranches if b.startswith('origin/')]
+        if nb not in rbranches:
+          #remote branch doesn't exist for this repo, quit with error message
+          print >>sys.stderr, "error: remote branch '%s' does not exist on '%s', can't complete checkout" % (nb, project.name)
+          sys.exit(1)
+
+      #branch exists on all remotes, run checkout everywhere
+      print >>sys.stderr, "note: remote branches all exist! checking out now"
+      for project in all:
+        print >>sys.stdout, "%s:" % project.name
+        out = project.work_git.checkout(nb)
+        print >>sys.stdout, out
+        print >>sys.stdout
