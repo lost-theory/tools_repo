@@ -21,12 +21,6 @@ class Clone(Command):
   helpUsage = """
 %prog
 """
-  def _Options(self, p):
-    def cmd(option, opt_str, value, parser):
-      setattr(parser.values, option.dest, list(parser.rargs))
-      while parser.rargs:
-        del parser.rargs[0]
-
   def Execute(self, opt, args):
     if os.path.exists(os.path.join(self.repodir, "projects")):
       print >>sys.stderr, "this working directory has already been cloned into. exiting."
