@@ -54,9 +54,31 @@ class Flow(Command):
     if len(current_branches) != 1:
       print >>sys.stderr, "error: not all repos are on the same branch, run 'repo branches' for more info"
       sys.exit(1)
+    current_branch = current_branches.pop()
 
-    flow_command = ["flow"]
-    flow_command.extend(shlex.split(" ".join(opt.command)))
+    #for 'finish' commands, make sure the branch exists on the remote
+    flow_command = shlex.split(" ".join(opt.command))
+    if 'finish' in flow_command:
+      if flow_command[-1] == 'finish' or flow_command[-1].startswith('-'):
+        #branch name not given, use current_branch
+        branch_to_finish = current_branch
+      else:
+        #branch name given in flow command
+        branch_to_finish = "%s/%s" % (flow_command[0], flow_command[-1])
+
+      for project in self.GetProjects(args):
+        rbranches = project.work_git.branch("-r")
+        rbranches = rbranches.strip().split('\n')
+        rbranches = map(lambda s: s.split('->')[0].strip(), rbranches)
+        rbranches = [b.replace('origin/', '') for b in rbranches if b.startswith('origin/')]
+        if branch_to_finish not in rbranches:
+          #remote branch doesn't exist for this repo, quit with error message
+          print >>sys.stderr, "error: remote branch '%s' does not exist on '%s', can't finish yet" % (branch_to_finish, project.name)
+          print >>sys.stderr, "please push the branch upstream before finishing:"
+          print >>sys.stderr, "    git push -u origin %s" % branch_to_finish
+          sys.exit(1)
+
+    flow_command.insert(0, 'flow')
     for project in self.GetProjects(args):
       print >>sys.stdout, "%s:" % project.name
       if GitCommand(project, flow_command).Wait() != 0:
