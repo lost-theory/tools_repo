@@ -59,7 +59,7 @@ The command is equivalent to:
           "error: %s/: cannot checkout %s" \
           % (p.relpath, nb)
       sys.exit(1)
-    elif not success:
+    elif not success or len(success) != len(all):
       #branch does not exist locally, check all remotes
       print >>sys.stderr, "note: no project has local branch '%s', searching remotes..." % nb
       for project in all:
