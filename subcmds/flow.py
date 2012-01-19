@@ -16,6 +16,8 @@ from git_command import GitCommand
 from command import Command
 from sync import Sync
 
+GIT_FLOW_SUBCOMMANDS = ['init', 'feature', 'release', 'hotfix', 'support', 'version']
+
 class Flow(Command):
   common = True
   helpSummary = "Passes a git flow command along to multiple repos (only if everything is on the same branch)"
@@ -57,8 +59,16 @@ class Flow(Command):
     current_branch = current_branches.pop()
 
     #for 'finish' commands, make sure the branch exists on the remote
-    flow_command = shlex.split(" ".join(opt.command))
-    if 'finish' in flow_command:
+    flow_command = shlex.split(" ".join(opt.command or []))
+
+    subcommand = flow_command[0] if len(flow_command) > 0 else ''
+    operation = flow_command[1] if len(flow_command) > 1 else ''
+    if subcommand not in GIT_FLOW_SUBCOMMANDS:
+      print >>sys.stderr, "error: invalid git-flow subcommand '%s'" % subcommand
+      print >>sys.stderr, "valid subcommands are:", ", ".join(GIT_FLOW_SUBCOMMANDS)
+      sys.exit(1)
+
+    if operation == 'finish':
       if flow_command[-1] == 'finish' or flow_command[-1].startswith('-'):
         #branch name not given, use current_branch
         branch_to_finish = current_branch
