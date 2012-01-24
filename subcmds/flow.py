@@ -38,7 +38,7 @@ class Flow(Command):
   def Execute(self, opt, args):
     current_branches = set()
     for project in self.GetProjects(args):
-      status = project.work_git.status()
+      status = project.work_git.status('--ignore-submodules')
       firstline = status.split('\n')[0]
 
       #check if repo is on a branch, and add it to current branches
