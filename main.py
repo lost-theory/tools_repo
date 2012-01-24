@@ -166,14 +166,14 @@ def _CheckWrapperVersion(ver, repo_path):
 """ % (exp_str, _MyWrapperPath(), repo_path)
     sys.exit(1)
 
-  if exp > ver:
-    exp_str = '.'.join(map(lambda x: str(x), exp))
-    print >>sys.stderr, """
-... A new repo command (%5s) is available.
-... You should upgrade soon:
-
-    cp %s %s
-""" % (exp_str, _MyWrapperPath(), repo_path)
+#  if exp > ver:
+#    exp_str = '.'.join(map(lambda x: str(x), exp))
+#    print >>sys.stderr, """
+#... A new repo command (%5s) is available.
+#... You should upgrade soon:
+#
+#    cp %s %s
+#""" % (exp_str, _MyWrapperPath(), repo_path)
 
 def _CheckRepoDir(dir):
   if not dir:
