@@ -14,52 +14,67 @@
 # limitations under the License.
 
 import os
+import re
 import sys
+import urlparse
 import xml.dom.minidom
 
-from git_config import GitConfig
-from git_config import IsId
-from manifest import Manifest
-from project import RemoteSpec
-from project import Project
-from project import MetaProject
-from project import R_HEADS
-from project import HEAD
+from git_config import GitConfig, IsId
+from project import RemoteSpec, Project, MetaProject, R_HEADS, HEAD
 from error import ManifestParseError
 
 MANIFEST_FILE_NAME = 'manifest.xml'
 LOCAL_MANIFEST_NAME = 'local_manifest.xml'
-R_M = 'refs/remotes/m/'
+
+urlparse.uses_relative.extend(['ssh', 'git'])
+urlparse.uses_netloc.extend(['ssh', 'git'])
 
 class _Default(object):
   """Project defaults within the manifest."""
 
   revisionExpr = None
   remote = None
+  sync_j = 1
 
 class _XmlRemote(object):
   def __init__(self,
                name,
                fetch=None,
+               manifestUrl=None,
                review=None):
     self.name = name
     self.fetchUrl = fetch
+    self.manifestUrl = manifestUrl
     self.reviewUrl = review
+    self.resolvedFetchUrl = self._resolveFetchUrl()
+
+  def _resolveFetchUrl(self):
+    url = self.fetchUrl.rstrip('/')
+    manifestUrl = self.manifestUrl.rstrip('/')
+    # urljoin will get confused if there is no scheme in the base url
+    # ie, if manifestUrl is of the form <hostname:port>
+    if manifestUrl.find(':') != manifestUrl.find('/') - 1:
+        manifestUrl = 'gopher://' + manifestUrl
+    url = urlparse.urljoin(manifestUrl, url)
+    return re.sub(r'^gopher://', '', url)
 
   def ToRemoteSpec(self, projectName):
-    url = self.fetchUrl
-    while url.endswith('/'):
-      url = url[:-1]
-    url += '/%s.git' % projectName
+    url = self.resolvedFetchUrl.rstrip('/') + '/' + projectName
     return RemoteSpec(self.name, url, self.reviewUrl)
 
-class XmlManifest(Manifest):
+class XmlManifest(object):
   """manages the repo configuration file"""
 
   def __init__(self, repodir):
-    Manifest.__init__(self, repodir)
+    self.repodir = os.path.abspath(repodir)
+    self.topdir = os.path.dirname(self.repodir)
+    self.manifestFile = os.path.join(self.repodir, MANIFEST_FILE_NAME)
+    self.globalConfig = GitConfig.ForUser()
 
-    self._manifestFile = os.path.join(repodir, MANIFEST_FILE_NAME)
+    self.repoProject = MetaProject(self, 'repo',
+      gitdir   = os.path.join(repodir, 'repo/.git'),
+      worktree = os.path.join(repodir, 'repo'))
+
     self.manifestProject = MetaProject(self, 'manifests',
       gitdir   = os.path.join(repodir, 'manifests.git'),
       worktree = os.path.join(repodir, 'manifests'))
@@ -73,13 +88,13 @@ class XmlManifest(Manifest):
     if not os.path.isfile(path):
       raise ManifestParseError('manifest %s not found' % name)
 
-    old = self._manifestFile
+    old = self.manifestFile
     try:
-      self._manifestFile = path
+      self.manifestFile = path
       self._Unload()
       self._Load()
     finally:
-      self._manifestFile = old
+      self.manifestFile = old
 
   def Link(self, name):
     """Update the repo metadata to use a different manifest.
@@ -87,9 +102,9 @@ class XmlManifest(Manifest):
     self.Override(name)
 
     try:
-      if os.path.exists(self._manifestFile):
-        os.remove(self._manifestFile)
-      os.symlink('manifests/%s' % name, self._manifestFile)
+      if os.path.exists(self.manifestFile):
+        os.remove(self.manifestFile)
+      os.symlink('manifests/%s' % name, self.manifestFile)
     except OSError, e:
       raise ManifestParseError('cannot link manifest %s' % name)
 
@@ -134,6 +149,9 @@ class XmlManifest(Manifest):
     if d.revisionExpr:
       have_default = True
       e.setAttribute('revision', d.revisionExpr)
+    if d.sync_j > 1:
+      have_default = True
+      e.setAttribute('sync-j', '%d' % d.sync_j)
     if have_default:
       root.appendChild(e)
       root.appendChild(doc.createTextNode(''))
@@ -172,6 +190,14 @@ class XmlManifest(Manifest):
         ce.setAttribute('dest', c.dest)
         e.appendChild(ce)
 
+    if self._repo_hooks_project:
+      root.appendChild(doc.createTextNode(''))
+      e = doc.createElement('repo-hooks')
+      e.setAttribute('in-project', self._repo_hooks_project.name)
+      e.setAttribute('enabled-list',
+                     ' '.join(self._repo_hooks_project.enabled_repo_hooks))
+      root.appendChild(e)
+
     doc.writexml(fd, '', '  ', '\n', 'UTF-8')
 
   @property
@@ -190,6 +216,11 @@ class XmlManifest(Manifest):
     return self._default
 
   @property
+  def repo_hooks_project(self):
+    self._Load()
+    return self._repo_hooks_project
+
+  @property
   def notice(self):
     self._Load()
     return self._notice
@@ -199,21 +230,21 @@ class XmlManifest(Manifest):
     self._Load()
     return self._manifest_server
 
-  def InitBranch(self):
-    m = self.manifestProject
-    if m.CurrentBranch is None:
-      return m.StartBranch('default')
-    return True
+  @property
+  def disabled_subcmds(self):
+    self._Load()
+    return self._disabled_subcmds
 
-  def SetMRefs(self, project):
-    if self.branch:
-      project._InitAnyMRef(R_M + self.branch)
+  @property
+  def IsMirror(self):
+    return self.manifestProject.config.GetBoolean('repo.mirror')
 
   def _Unload(self):
     self._loaded = False
     self._projects = {}
     self._remotes = {}
     self._default = None
+    self._repo_hooks_project = None
     self._notice = None
     self.branch = None
     self._manifest_server = None
@@ -221,10 +252,7 @@ class XmlManifest(Manifest):
   def _Load(self):
     if not self._loaded:
       m = self.manifestProject
-      b = m.GetBranch(m.CurrentBranch)
-      if b.remote and b.remote.name:
-        m.remote.name = b.remote.name
-      b = b.merge
+      b = m.GetBranch(m.CurrentBranch).merge
       if b is not None and b.startswith(R_HEADS):
         b = b[len(R_HEADS):]
       self.branch = b
@@ -234,11 +262,11 @@ class XmlManifest(Manifest):
       local = os.path.join(self.repodir, LOCAL_MANIFEST_NAME)
       if os.path.exists(local):
         try:
-          real = self._manifestFile
-          self._manifestFile = local
+          real = self.manifestFile
+          self.manifestFile = local
           self._ParseManifest(False)
         finally:
-          self._manifestFile = real
+          self.manifestFile = real
 
       if self.IsMirror:
         self._AddMetaProjectMirror(self.repoProject)
@@ -247,17 +275,17 @@ class XmlManifest(Manifest):
       self._loaded = True
 
   def _ParseManifest(self, is_root_file):
-    root = xml.dom.minidom.parse(self._manifestFile)
+    root = xml.dom.minidom.parse(self.manifestFile)
     if not root or not root.childNodes:
-      raise ManifestParseError, \
-            "no root node in %s" % \
-            self._manifestFile
+      raise ManifestParseError(
+          "no root node in %s" %
+          self.manifestFile)
 
     config = root.childNodes[0]
     if config.nodeName != 'manifest':
-      raise ManifestParseError, \
-            "no <manifest> in %s" % \
-            self._manifestFile
+      raise ManifestParseError(
+          "no <manifest> in %s" %
+          self.manifestFile)
 
     for node in config.childNodes:
       if node.nodeName == 'remove-project':
@@ -265,25 +293,30 @@ class XmlManifest(Manifest):
         try:
           del self._projects[name]
         except KeyError:
-          raise ManifestParseError, \
-                'project %s not found' % \
-                (name)
+          raise ManifestParseError(
+              'project %s not found' %
+              (name))
+
+        # If the manifest removes the hooks project, treat it as if it deleted
+        # the repo-hooks element too.
+        if self._repo_hooks_project and (self._repo_hooks_project.name == name):
+          self._repo_hooks_project = None
 
     for node in config.childNodes:
       if node.nodeName == 'remote':
         remote = self._ParseRemote(node)
         if self._remotes.get(remote.name):
-          raise ManifestParseError, \
-                'duplicate remote %s in %s' % \
-                (remote.name, self._manifestFile)
+          raise ManifestParseError(
+              'duplicate remote %s in %s' %
+              (remote.name, self.manifestFile))
         self._remotes[remote.name] = remote
 
     for node in config.childNodes:
       if node.nodeName == 'default':
         if self._default is not None:
-          raise ManifestParseError, \
-                'duplicate default in %s' % \
-                (self._manifestFile)
+          raise ManifestParseError(
+              'duplicate default in %s' %
+              (self.manifestFile))
         self._default = self._ParseDefault(node)
     if self._default is None:
       self._default = _Default()
@@ -291,28 +324,56 @@ class XmlManifest(Manifest):
     for node in config.childNodes:
       if node.nodeName == 'notice':
         if self._notice is not None:
-          raise ManifestParseError, \
-                'duplicate notice in %s' % \
-                (self.manifestFile)
+          raise ManifestParseError(
+              'duplicate notice in %s' %
+              (self.manifestFile))
         self._notice = self._ParseNotice(node)
 
     for node in config.childNodes:
       if node.nodeName == 'manifest-server':
         url = self._reqatt(node, 'url')
         if self._manifest_server is not None:
-            raise ManifestParseError, \
-                'duplicate manifest-server in %s' % \
-                (self.manifestFile)
+            raise ManifestParseError(
+                'duplicate manifest-server in %s' %
+                (self.manifestFile))
         self._manifest_server = url
 
     for node in config.childNodes:
       if node.nodeName == 'project':
         project = self._ParseProject(node)
         if self._projects.get(project.name):
-          raise ManifestParseError, \
-                'duplicate project %s in %s' % \
-                (project.name, self._manifestFile)
+          raise ManifestParseError(
+              'duplicate project %s in %s' %
+              (project.name, self.manifestFile))
         self._projects[project.name] = project
+
+    self._disabled_subcmds = []
+    for node in config.childNodes:
+      if node.nodeName == 'disabled-subcmds':
+            self._disabled_subcmds = self._reqatt(node, 'subcmds').split(',')
+
+    for node in config.childNodes:
+      if node.nodeName == 'repo-hooks':
+        # Get the name of the project and the (space-separated) list of enabled.
+        repo_hooks_project = self._reqatt(node, 'in-project')
+        enabled_repo_hooks = self._reqatt(node, 'enabled-list').split()
+
+        # Only one project can be the hooks project
+        if self._repo_hooks_project is not None:
+          raise ManifestParseError(
+              'duplicate repo-hooks in %s' %
+              (self.manifestFile))
+
+        # Store a reference to the Project.
+        try:
+          self._repo_hooks_project = self._projects[repo_hooks_project]
+        except KeyError:
+          raise ManifestParseError(
+              'project %s not found for repo-hooks' %
+              (repo_hooks_project))
+
+        # Store the enabled hooks in the Project object.
+        self._repo_hooks_project.enabled_repo_hooks = enabled_repo_hooks
 
   def _AddMetaProjectMirror(self, m):
     name = None
@@ -321,7 +382,7 @@ class XmlManifest(Manifest):
       raise ManifestParseError, 'refusing to mirror %s' % m_url
 
     if self._default and self._default.remote:
-      url = self._default.remote.fetchUrl
+      url = self._default.remote.resolvedFetchUrl
       if not url.endswith('/'):
         url += '/'
       if m_url.startswith(url):
@@ -330,7 +391,8 @@ class XmlManifest(Manifest):
 
     if name is None:
       s = m_url.rindex('/') + 1
-      remote = _XmlRemote('origin', m_url[:s])
+      manifestUrl = self.manifestProject.config.GetString('remote.origin.url')
+      remote = _XmlRemote('origin', m_url[:s], manifestUrl)
       name = m_url[s:]
 
     if name.endswith('.git'):
@@ -358,7 +420,8 @@ class XmlManifest(Manifest):
     review = node.getAttribute('review')
     if review == '':
       review = None
-    return _XmlRemote(name, fetch, review)
+    manifestUrl = self.manifestProject.config.GetString('remote.origin.url')
+    return _XmlRemote(name, fetch, manifestUrl, review)
 
   def _ParseDefault(self, node):
     """
@@ -369,6 +432,11 @@ class XmlManifest(Manifest):
     d.revisionExpr = node.getAttribute('revision')
     if d.revisionExpr == '':
       d.revisionExpr = None
+    sync_j = node.getAttribute('sync-j')
+    if sync_j == '' or sync_j is None:
+      d.sync_j = 1
+    else:
+      d.sync_j = int(sync_j)
     return d
 
   def _ParseNotice(self, node):
@@ -422,7 +490,7 @@ class XmlManifest(Manifest):
     if remote is None:
       raise ManifestParseError, \
             "no remote for project %s within %s" % \
-            (name, self._manifestFile)
+            (name, self.manifestFile)
 
     revisionExpr = node.getAttribute('revision')
     if not revisionExpr:
@@ -430,7 +498,7 @@ class XmlManifest(Manifest):
     if not revisionExpr:
       raise ManifestParseError, \
             "no revision for project %s within %s" % \
-            (name, self._manifestFile)
+            (name, self.manifestFile)
 
     path = node.getAttribute('path')
     if not path:
@@ -438,7 +506,7 @@ class XmlManifest(Manifest):
     if path.startswith('/'):
       raise ManifestParseError, \
             "project %s path cannot be absolute in %s" % \
-            (name, self._manifestFile)
+            (name, self.manifestFile)
 
     if self.IsMirror:
       relpath = None
@@ -480,7 +548,7 @@ class XmlManifest(Manifest):
     if not v:
       raise ManifestParseError, \
             "remote %s not defined in %s" % \
-            (name, self._manifestFile)
+            (name, self.manifestFile)
     return v
 
   def _reqatt(self, node, attname):
@@ -491,5 +559,5 @@ class XmlManifest(Manifest):
     if not v:
       raise ManifestParseError, \
             "no %s in <%s> within %s" % \
-            (attname, node.nodeName, self._manifestFile)
+            (attname, node.nodeName, self.manifestFile)
     return v

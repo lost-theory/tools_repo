@@ -12,22 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import traceback
 import errno
 import filecmp
 import os
+import random
 import re
 import shutil
 import stat
 import sys
+import time
 import urllib2
+
+try:
+  import threading as _threading
+except ImportError:
+  import dummy_threading as _threading
+
+try:
+  from os import SEEK_END
+except ImportError:
+  SEEK_END = 2
 
 from color import Coloring
 from git_command import GitCommand
-from git_config import GitConfig, IsId
-from error import GitError, ImportError, UploadError
+from git_config import GitConfig, IsId, GetSchemeFromUrl, ID_RE
+from error import DownloadError
+from error import GitError, HookError, ImportError, UploadError
 from error import ManifestInvalidRevisionError
+from progress import Progress
 
 from git_refs import GitRefs, HEAD, R_HEADS, R_TAGS, R_PUB
+
+_urllib_lock = _threading.Lock()
 
 def _lwrite(path, content):
   lock = '%s.lock' % path
@@ -54,14 +71,25 @@ def not_rev(r):
 def sq(r):
   return "'" + r.replace("'", "'\''") + "'"
 
-hook_list = None
-def repo_hooks():
-  global hook_list
-  if hook_list is None:
+_project_hook_list = None
+def _ProjectHooks():
+  """List the hooks present in the 'hooks' directory.
+
+  These hooks are project hooks and are copied to the '.git/hooks' directory
+  of all subprojects.
+
+  This function caches the list of hooks (based on the contents of the
+  'repo/hooks' directory) on the first call.
+
+  Returns:
+    A list of absolute paths to all of the files in the hooks directory.
+  """
+  global _project_hook_list
+  if _project_hook_list is None:
     d = os.path.abspath(os.path.dirname(__file__))
     d = os.path.join(d , 'hooks')
-    hook_list = map(lambda x: os.path.join(d, x), os.listdir(d))
-  return hook_list
+    _project_hook_list = map(lambda x: os.path.join(d, x), os.listdir(d))
+  return _project_hook_list
 
 def relpath(dst, src):
   src = os.path.dirname(src)
@@ -223,6 +251,249 @@ class RemoteSpec(object):
     self.url = url
     self.review = review
 
+class RepoHook(object):
+  """A RepoHook contains information about a script to run as a hook.
+
+  Hooks are used to run a python script before running an upload (for instance,
+  to run presubmit checks).  Eventually, we may have hooks for other actions.
+
+  This shouldn't be confused with files in the 'repo/hooks' directory.  Those
+  files are copied into each '.git/hooks' folder for each project.  Repo-level
+  hooks are associated instead with repo actions.
+
+  Hooks are always python.  When a hook is run, we will load the hook into the
+  interpreter and execute its main() function.
+  """
+  def __init__(self,
+               hook_type,
+               hooks_project,
+               topdir,
+               abort_if_user_denies=False):
+    """RepoHook constructor.
+
+    Params:
+      hook_type: A string representing the type of hook.  This is also used
+          to figure out the name of the file containing the hook.  For
+          example: 'pre-upload'.
+      hooks_project: The project containing the repo hooks.  If you have a
+          manifest, this is manifest.repo_hooks_project.  OK if this is None,
+          which will make the hook a no-op.
+      topdir: Repo's top directory (the one containing the .repo directory).
+          Scripts will run with CWD as this directory.  If you have a manifest,
+          this is manifest.topdir
+      abort_if_user_denies: If True, we'll throw a HookError() if the user
+          doesn't allow us to run the hook.
+    """
+    self._hook_type = hook_type
+    self._hooks_project = hooks_project
+    self._topdir = topdir
+    self._abort_if_user_denies = abort_if_user_denies
+
+    # Store the full path to the script for convenience.
+    if self._hooks_project:
+      self._script_fullpath = os.path.join(self._hooks_project.worktree,
+                                           self._hook_type + '.py')
+    else:
+      self._script_fullpath = None
+
+  def _GetHash(self):
+    """Return a hash of the contents of the hooks directory.
+
+    We'll just use git to do this.  This hash has the property that if anything
+    changes in the directory we will return a different has.
+
+    SECURITY CONSIDERATION:
+      This hash only represents the contents of files in the hook directory, not
+      any other files imported or called by hooks.  Changes to imported files
+      can change the script behavior without affecting the hash.
+
+    Returns:
+      A string representing the hash.  This will always be ASCII so that it can
+      be printed to the user easily.
+    """
+    assert self._hooks_project, "Must have hooks to calculate their hash."
+
+    # We will use the work_git object rather than just calling GetRevisionId().
+    # That gives us a hash of the latest checked in version of the files that
+    # the user will actually be executing.  Specifically, GetRevisionId()
+    # doesn't appear to change even if a user checks out a different version
+    # of the hooks repo (via git checkout) nor if a user commits their own revs.
+    #
+    # NOTE: Local (non-committed) changes will not be factored into this hash.
+    # I think this is OK, since we're really only worried about warning the user
+    # about upstream changes.
+    return self._hooks_project.work_git.rev_parse('HEAD')
+
+  def _GetMustVerb(self):
+    """Return 'must' if the hook is required; 'should' if not."""
+    if self._abort_if_user_denies:
+      return 'must'
+    else:
+      return 'should'
+
+  def _CheckForHookApproval(self):
+    """Check to see whether this hook has been approved.
+
+    We'll look at the hash of all of the hooks.  If this matches the hash that
+    the user last approved, we're done.  If it doesn't, we'll ask the user
+    about approval.
+
+    Note that we ask permission for each individual hook even though we use
+    the hash of all hooks when detecting changes.  We'd like the user to be
+    able to approve / deny each hook individually.  We only use the hash of all
+    hooks because there is no other easy way to detect changes to local imports.
+
+    Returns:
+      True if this hook is approved to run; False otherwise.
+
+    Raises:
+      HookError: Raised if the user doesn't approve and abort_if_user_denies
+          was passed to the consturctor.
+    """
+    hooks_dir = self._hooks_project.worktree
+    hooks_config = self._hooks_project.config
+    git_approval_key = 'repo.hooks.%s.approvedhash' % self._hook_type
+
+    # Get the last hash that the user approved for this hook; may be None.
+    old_hash = hooks_config.GetString(git_approval_key)
+
+    # Get the current hash so we can tell if scripts changed since approval.
+    new_hash = self._GetHash()
+
+    if old_hash is not None:
+      # User previously approved hook and asked not to be prompted again.
+      if new_hash == old_hash:
+        # Approval matched.  We're done.
+        return True
+      else:
+        # Give the user a reason why we're prompting, since they last told
+        # us to "never ask again".
+        prompt = 'WARNING: Scripts have changed since %s was allowed.\n\n' % (
+            self._hook_type)
+    else:
+      prompt = ''
+
+    # Prompt the user if we're not on a tty; on a tty we'll assume "no".
+    if sys.stdout.isatty():
+      prompt += ('Repo %s run the script:\n'
+                 '  %s\n'
+                 '\n'
+                 'Do you want to allow this script to run '
+                 '(yes/yes-never-ask-again/NO)? ') % (
+                 self._GetMustVerb(), self._script_fullpath)
+      response = raw_input(prompt).lower()
+      print
+
+      # User is doing a one-time approval.
+      if response in ('y', 'yes'):
+        return True
+      elif response == 'yes-never-ask-again':
+        hooks_config.SetString(git_approval_key, new_hash)
+        return True
+
+    # For anything else, we'll assume no approval.
+    if self._abort_if_user_denies:
+      raise HookError('You must allow the %s hook or use --no-verify.' %
+                      self._hook_type)
+
+    return False
+
+  def _ExecuteHook(self, **kwargs):
+    """Actually execute the given hook.
+
+    This will run the hook's 'main' function in our python interpreter.
+
+    Args:
+      kwargs: Keyword arguments to pass to the hook.  These are often specific
+          to the hook type.  For instance, pre-upload hooks will contain
+          a project_list.
+    """
+    # Keep sys.path and CWD stashed away so that we can always restore them
+    # upon function exit.
+    orig_path = os.getcwd()
+    orig_syspath = sys.path
+
+    try:
+      # Always run hooks with CWD as topdir.
+      os.chdir(self._topdir)
+
+      # Put the hook dir as the first item of sys.path so hooks can do
+      # relative imports.  We want to replace the repo dir as [0] so
+      # hooks can't import repo files.
+      sys.path = [os.path.dirname(self._script_fullpath)] + sys.path[1:]
+
+      # Exec, storing global context in the context dict.  We catch exceptions
+      # and  convert to a HookError w/ just the failing traceback.
+      context = {}
+      try:
+        execfile(self._script_fullpath, context)
+      except Exception:
+        raise HookError('%s\nFailed to import %s hook; see traceback above.' % (
+                        traceback.format_exc(), self._hook_type))
+
+      # Running the script should have defined a main() function.
+      if 'main' not in context:
+        raise HookError('Missing main() in: "%s"' % self._script_fullpath)
+
+
+      # Add 'hook_should_take_kwargs' to the arguments to be passed to main.
+      # We don't actually want hooks to define their main with this argument--
+      # it's there to remind them that their hook should always take **kwargs.
+      # For instance, a pre-upload hook should be defined like:
+      #   def main(project_list, **kwargs):
+      #
+      # This allows us to later expand the API without breaking old hooks.
+      kwargs = kwargs.copy()
+      kwargs['hook_should_take_kwargs'] = True
+
+      # Call the main function in the hook.  If the hook should cause the
+      # build to fail, it will raise an Exception.  We'll catch that convert
+      # to a HookError w/ just the failing traceback.
+      try:
+        context['main'](**kwargs)
+      except Exception:
+        raise HookError('%s\nFailed to run main() for %s hook; see traceback '
+                        'above.' % (
+                        traceback.format_exc(), self._hook_type))
+    finally:
+      # Restore sys.path and CWD.
+      sys.path = orig_syspath
+      os.chdir(orig_path)
+
+  def Run(self, user_allows_all_hooks, **kwargs):
+    """Run the hook.
+
+    If the hook doesn't exist (because there is no hooks project or because
+    this particular hook is not enabled), this is a no-op.
+
+    Args:
+      user_allows_all_hooks: If True, we will never prompt about running the
+          hook--we'll just assume it's OK to run it.
+      kwargs: Keyword arguments to pass to the hook.  These are often specific
+          to the hook type.  For instance, pre-upload hooks will contain
+          a project_list.
+
+    Raises:
+      HookError: If there was a problem finding the hook or the user declined
+          to run a required hook (from _CheckForHookApproval).
+    """
+    # No-op if there is no hooks project or if hook is disabled.
+    if ((not self._hooks_project) or
+        (self._hook_type not in self._hooks_project.enabled_repo_hooks)):
+      return
+
+    # Bail with a nice error if we can't find the hook.
+    if not os.path.isfile(self._script_fullpath):
+      raise HookError('Couldn\'t find repo hook: "%s"' % self._script_fullpath)
+
+    # Make sure the user is OK with running the hook.
+    if (not user_allows_all_hooks) and (not self._CheckForHookApproval()):
+      return
+
+    # Run the hook with the same version of python we're using.
+    self._ExecuteHook(**kwargs)
+
+
 class Project(object):
   def __init__(self,
                manifest,
@@ -263,6 +534,10 @@ class Project(object):
       self.work_git = None
     self.bare_git = self._GitGetByExec(self, bare=True)
     self.bare_ref = GitRefs(gitdir)
+
+    # This will be filled in if a project is later identified to be the
+    # project containing repo hooks.
+    self.enabled_repo_hooks = []
 
   @property
   def Exists(self):
@@ -391,13 +666,18 @@ class Project(object):
 
     return False
 
-  def PrintWorkTreeStatus(self):
+  def PrintWorkTreeStatus(self, output_redir=None):
     """Prints the status of the repository to stdout.
+
+    Args:
+      output: If specified, redirect the output to this object.
     """
     if not os.path.isdir(self.worktree):
-      print ''
-      print 'project %s/' % self.relpath
-      print '  missing (run "repo sync")'
+      if output_redir == None:
+        output_redir = sys.stdout
+      print >>output_redir, ''
+      print >>output_redir, 'project %s/' % self.relpath
+      print >>output_redir, '  missing (run "repo sync")'
       return
 
     self.work_git.update_index('-q',
@@ -412,6 +692,8 @@ class Project(object):
       return 'CLEAN'
 
     out = StatusColoring(self.config)
+    if not output_redir == None:
+      out.redirect(output_redir)
     out.project('project %-40s', self.relpath + '/')
 
     branch = self.CurrentBranch
@@ -461,6 +743,7 @@ class Project(object):
       else:
         out.write('%s', line)
       out.nl()
+
     return 'DIRTY'
 
   def PrintWorkTreeDiff(self):
@@ -524,7 +807,7 @@ class Project(object):
       if R_HEADS + n not in heads:
         self.bare_git.DeleteRef(name, id)
 
-  def GetUploadableBranches(self):
+  def GetUploadableBranches(self, selected_branch=None):
     """List any branches which can be uploaded for review.
     """
     heads = {}
@@ -539,6 +822,8 @@ class Project(object):
     ready = []
     for branch, id in heads.iteritems():
       if branch in pubed and pubed[branch] == id:
+        continue
+      if selected_branch and branch != selected_branch:
         continue
 
       rb = self.GetUploadableBranch(branch)
@@ -615,32 +900,35 @@ class Project(object):
 
 ## Sync ##
 
-  def Sync_NetworkHalf(self, quiet=False):
+  def Sync_NetworkHalf(self, quiet=False, is_new=None, current_branch_only=False):
     """Perform only the network IO portion of the sync process.
        Local working directory/branch state is not affected.
     """
-    is_new = not self.Exists
+    if is_new is None:
+      is_new = not self.Exists
     if is_new:
-      if not quiet:
-        print >>sys.stderr
-        print >>sys.stderr, 'Initializing project %s ...' % self.name
       self._InitGitDir()
-
     self._InitRemote()
-    if not self._RemoteFetch(initial=is_new, quiet=quiet):
-      return False
 
-    #Check that the requested ref was found after fetch
-    #
-    try:
-      self.GetRevisionId()
-    except ManifestInvalidRevisionError:
-      # if the ref is a tag. We can try fetching
-      # the tag manually as a last resort
-      #
-      rev = self.revisionExpr
-      if rev.startswith(R_TAGS):
-        self._RemoteFetch(None, rev[len(R_TAGS):], quiet=quiet)
+    if is_new:
+      alt = os.path.join(self.gitdir, 'objects/info/alternates')
+      try:
+        fd = open(alt, 'rb')
+        try:
+          alt_dir = fd.readline().rstrip()
+        finally:
+          fd.close()
+      except IOError:
+        alt_dir = None
+    else:
+      alt_dir = None
+
+    if alt_dir is None and self._ApplyCloneBundle(initial=is_new, quiet=quiet):
+      is_new = False
+
+    if not self._RemoteFetch(initial=is_new, quiet=quiet, alt_dir=alt_dir,
+                             current_branch_only=current_branch_only):
+      return False
 
     if self.worktree:
       self.manifest.SetMRefs(self)
@@ -680,11 +968,11 @@ class Project(object):
     """Perform only the local IO portion of the sync process.
        Network access is not required.
     """
-    self._InitWorkTree()
     all = self.bare_ref.all
     self.CleanPublishedCache(all)
-
     revid = self.GetRevisionId(all)
+
+    self._InitWorkTree()
     head = self.work_git.GetHead()
     if head.startswith(R_HEADS):
       branch = head[len(R_HEADS):]
@@ -728,7 +1016,7 @@ class Project(object):
 
     if not branch.LocalMerge:
       # The current branch has no tracking configuration.
-      # Jump off it to a deatched HEAD.
+      # Jump off it to a detached HEAD.
       #
       syncbuf.info(self,
                    "leaving %s; does not track upstream",
@@ -900,6 +1188,13 @@ class Project(object):
 
   def CheckoutBranch(self, name):
     """Checkout a local topic branch.
+
+        Args:
+          name: The name of the branch to checkout.
+
+        Returns:
+          True if the checkout succeeded; False if it didn't; None if the branch
+          didn't exist.
     """
     rev = R_HEADS + name
     head = self.work_git.GetHead()
@@ -914,7 +1209,7 @@ class Project(object):
     except KeyError:
       # Branch does not exist in this project
       #
-      return False
+      return None
 
     if head.startswith(R_HEADS):
       try:
@@ -932,18 +1227,23 @@ class Project(object):
 
     return GitCommand(self,
                       ['checkout', name, '--'],
-                      capture_stdout = True,
-                      capture_stderr = True).Wait() == 0
+                      capture_stdout = True).Wait() == 0
 
   def AbandonBranch(self, name):
     """Destroy a local topic branch.
+
+    Args:
+      name: The name of the branch to abandon.
+
+    Returns:
+      True if the abandon succeeded; False if it didn't; None if the branch
+      didn't exist.
     """
     rev = R_HEADS + name
     all = self.bare_ref.all
     if rev not in all:
-      # Doesn't exist; assume already abandoned.
-      #
-      return True
+      # Doesn't exist
+      return None
 
     head = self.work_git.GetHead()
     if head == rev:
@@ -1023,31 +1323,41 @@ class Project(object):
 
 ## Direct Git Commands ##
 
-  def _RemoteFetch(self, name=None, tag=None,
+  def _RemoteFetch(self, name=None,
+                   current_branch_only=False,
                    initial=False,
-                   quiet=False):
+                   quiet=False,
+                   alt_dir=None):
+
+    is_sha1 = False
+    tag_name = None
+
+    if current_branch_only:
+      if ID_RE.match(self.revisionExpr) is not None:
+        is_sha1 = True
+      elif self.revisionExpr.startswith(R_TAGS):
+        # this is a tag and its sha1 value should never change
+        tag_name = self.revisionExpr[len(R_TAGS):]
+
+      if is_sha1 or tag_name is not None:
+        try:
+          self.GetRevisionId()
+          return True
+        except ManifestInvalidRevisionError:
+          # There is no such persistent revision. We have to fetch it.
+          pass
+
     if not name:
       name = self.remote.name
 
     ssh_proxy = False
-    if self.GetRemote(name).PreConnectFetch():
+    remote = self.GetRemote(name)
+    if remote.PreConnectFetch():
       ssh_proxy = True
 
     if initial:
-      alt = os.path.join(self.gitdir, 'objects/info/alternates')
-      try:
-        fd = open(alt, 'rb')
-        try:
-          ref_dir = fd.readline()
-          if ref_dir and ref_dir.endswith('\n'):
-            ref_dir = ref_dir[:-1]
-        finally:
-          fd.close()
-      except IOError, e:
-        ref_dir = None
-
-      if ref_dir and 'objects' == os.path.basename(ref_dir):
-        ref_dir = os.path.dirname(ref_dir)
+      if alt_dir and 'objects' == os.path.basename(alt_dir):
+        ref_dir = os.path.dirname(alt_dir)
         packed_refs = os.path.join(self.gitdir, 'packed-refs')
         remote = self.GetRemote(name)
 
@@ -1083,34 +1393,188 @@ class Project(object):
             old_packed += line
 
         _lwrite(packed_refs, tmp_packed)
-
       else:
-        ref_dir = None
+        alt_dir = None
+
+    cmd = ['fetch']
+
+    # The --depth option only affects the initial fetch; after that we'll do
+    # full fetches of changes.
+    depth = self.manifest.manifestProject.config.GetString('repo.depth')
+    if depth and initial:
+      cmd.append('--depth=%s' % depth)
+
+    if quiet:
+      cmd.append('--quiet')
+    if not self.worktree:
+      cmd.append('--update-head-ok')
+    cmd.append(name)
+
+    if not current_branch_only or is_sha1:
+      # Fetch whole repo
+      cmd.append('--tags')
+      cmd.append((u'+refs/heads/*:') + remote.ToLocal('refs/heads/*'))
+    elif tag_name is not None:
+      cmd.append('tag')
+      cmd.append(tag_name)
+    else:
+      branch = self.revisionExpr
+      if branch.startswith(R_HEADS):
+        branch = branch[len(R_HEADS):]
+      cmd.append((u'+refs/heads/%s:' % branch) + remote.ToLocal('refs/heads/%s' % branch))
+
+    ok = False
+    for i in range(2):
+      if GitCommand(self, cmd, bare=True, ssh_proxy=ssh_proxy).Wait() == 0:
+        ok = True
+        break
+      time.sleep(random.randint(30, 45))
+
+    if initial:
+      if alt_dir:
+        if old_packed != '':
+          _lwrite(packed_refs, old_packed)
+        else:
+          os.remove(packed_refs)
+      self.bare_git.pack_refs('--all', '--prune')
+    return ok
+
+  def _ApplyCloneBundle(self, initial=False, quiet=False):
+    if initial and self.manifest.manifestProject.config.GetString('repo.depth'):
+      return False
+
+    remote = self.GetRemote(self.remote.name)
+    bundle_url = remote.url + '/clone.bundle'
+    bundle_url = GitConfig.ForUser().UrlInsteadOf(bundle_url)
+    if GetSchemeFromUrl(bundle_url) not in ('http', 'https'):
+      return False
+
+    bundle_dst = os.path.join(self.gitdir, 'clone.bundle')
+    bundle_tmp = os.path.join(self.gitdir, 'clone.bundle.tmp')
+
+    exist_dst = os.path.exists(bundle_dst)
+    exist_tmp = os.path.exists(bundle_tmp)
+
+    if not initial and not exist_dst and not exist_tmp:
+      return False
+
+    if not exist_dst:
+      exist_dst = self._FetchBundle(bundle_url, bundle_tmp, bundle_dst, quiet)
+    if not exist_dst:
+      return False
 
     cmd = ['fetch']
     if quiet:
       cmd.append('--quiet')
     if not self.worktree:
       cmd.append('--update-head-ok')
-    cmd.append(name)
-    if tag is not None:
-      cmd.append('tag')
-      cmd.append(tag)
+    cmd.append(bundle_dst)
+    for f in remote.fetch:
+      cmd.append(str(f))
+    cmd.append('refs/tags/*:refs/tags/*')
 
-    ok = GitCommand(self,
-                    cmd,
-                    bare = True,
-                    ssh_proxy = ssh_proxy).Wait() == 0
-
-    if initial:
-      if ref_dir:
-        if old_packed != '':
-          _lwrite(packed_refs, old_packed)
-        else:
-          os.remove(packed_refs)
-      self.bare_git.pack_refs('--all', '--prune')
-
+    ok = GitCommand(self, cmd, bare=True).Wait() == 0
+    if os.path.exists(bundle_dst):
+      os.remove(bundle_dst)
+    if os.path.exists(bundle_tmp):
+      os.remove(bundle_tmp)
     return ok
+
+  def _FetchBundle(self, srcUrl, tmpPath, dstPath, quiet):
+    keep = True
+    done = False
+    dest = open(tmpPath, 'a+b')
+    try:
+      dest.seek(0, SEEK_END)
+      pos = dest.tell()
+
+      _urllib_lock.acquire()
+      try:
+        req = urllib2.Request(srcUrl)
+        if pos > 0:
+          req.add_header('Range', 'bytes=%d-' % pos)
+
+        try:
+          r = urllib2.urlopen(req)
+        except urllib2.HTTPError, e:
+          def _content_type():
+            try:
+              return e.info()['content-type']
+            except:
+              return None
+
+          if e.code == 404:
+            keep = False
+            return False
+          elif _content_type() == 'text/plain':
+            try:
+              msg = e.read()
+              if len(msg) > 0 and msg[-1] == '\n':
+                msg = msg[0:-1]
+              msg = ' (%s)' % msg
+            except:
+              msg = ''
+          else:
+            try:
+              from BaseHTTPServer import BaseHTTPRequestHandler
+              res = BaseHTTPRequestHandler.responses[e.code]
+              msg = ' (%s: %s)' % (res[0], res[1])
+            except:
+              msg = ''
+          raise DownloadError('HTTP %s%s' % (e.code, msg))
+        except urllib2.URLError, e:
+          raise DownloadError('%s: %s ' % (req.get_host(), str(e)))
+      finally:
+        _urllib_lock.release()
+
+      p = None
+      try:
+        size = r.headers['content-length']
+        unit = 1 << 10
+
+        if size and not quiet:
+          if size > 1024 * 1.3:
+            unit = 1 << 20
+            desc = 'MB'
+          else:
+            desc = 'KB'
+          p = Progress(
+            'Downloading %s' % self.relpath,
+            int(size) / unit,
+            units=desc)
+          if pos > 0:
+            p.update(pos / unit)
+
+        s = 0
+        while True:
+          d = r.read(8192)
+          if d == '':
+            done = True
+            return True
+          dest.write(d)
+          if p:
+            s += len(d)
+            if s >= unit:
+              p.update(s / unit)
+              s = s % unit
+        if p:
+          if s >= unit:
+            p.update(s / unit)
+          else:
+            p.update(1)
+      finally:
+        r.close()
+        if p:
+          p.end()
+    finally:
+      dest.close()
+
+      if os.path.exists(dstPath):
+        os.remove(dstPath)
+      if done:
+        os.rename(tmpPath, dstPath)
+      elif not keep:
+        os.remove(tmpPath)
 
   def _Checkout(self, rev, quiet=False):
     cmd = ['checkout']
@@ -1192,13 +1656,16 @@ class Project(object):
     hooks = self._gitdir_path('hooks')
     if not os.path.exists(hooks):
       os.makedirs(hooks)
-    for stock_hook in repo_hooks():
+    for stock_hook in _ProjectHooks():
       name = os.path.basename(stock_hook)
 
-      if name in ('commit-msg') and not self.remote.review:
+      if name in ('commit-msg',) and not self.remote.review \
+            and not self is self.manifest.manifestProject:
         # Don't install a Gerrit Code Review hook if this
         # project does not appear to use it for reviews.
         #
+        # Since the manifest project is one of those, but also
+        # managed through gerrit, it's excluded
         continue
 
       dst = os.path.join(hooks, name)
@@ -1291,6 +1758,11 @@ class Project(object):
       cmd.append(HEAD)
       if GitCommand(self, cmd).Wait() != 0:
         raise GitError("cannot initialize work tree")
+
+      rr_cache = os.path.join(self.gitdir, 'rr-cache')
+      if not os.path.exists(rr_cache):
+        os.makedirs(rr_cache)
+
       self._CopyFiles()
 
   def _gitdir_path(self, path):
@@ -1449,6 +1921,22 @@ class Project(object):
       return r
 
     def __getattr__(self, name):
+      """Allow arbitrary git commands using pythonic syntax.
+
+      This allows you to do things like:
+        git_obj.rev_parse('HEAD')
+
+      Since we don't have a 'rev_parse' method defined, the __getattr__ will
+      run.  We'll replace the '_' with a '-' and try to run a git command.
+      Any other arguments will be passed to the git command.
+
+      Args:
+        name: The name of the git command to call.  Any '_' characters will
+            be replaced with '-'.
+
+      Returns:
+        A callable object that will try to call git with the named command.
+      """
       name = name.replace('_', '-')
       def runner(*args):
         cmdv = [name]

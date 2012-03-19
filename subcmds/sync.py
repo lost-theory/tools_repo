@@ -28,6 +28,14 @@ try:
 except ImportError:
   import dummy_threading as _threading
 
+try:
+  import resource
+  def _rlimit_nofile():
+    return resource.getrlimit(resource.RLIMIT_NOFILE)
+except ImportError:
+  def _rlimit_nofile():
+    return (256, 256)
+
 from git_command import GIT
 from git_refs import R_HEADS
 from project import HEAD
@@ -38,6 +46,10 @@ from error import RepoChangedException, GitError
 from project import R_HEADS
 from project import SyncBuffer
 from progress import Progress
+
+class _FetchError(Exception):
+  """Internal error thrown in _FetchHelper() when we don't want stack trace."""
+  pass
 
 class Sync(Command, MirrorSafeCommand):
   jobs = 1
@@ -68,7 +80,8 @@ revision is temporarily needed.
 
 The -s/--smart-sync option can be used to sync to a known good
 build as specified by the manifest-server element in the current
-manifest.
+manifest. The -t/--smart-tag option is similar and allows you to
+specify a custom tag/label.
 
 The -f/--force-broken option can be used to proceed with syncing
 other projects if a project sync fails.
@@ -104,6 +117,8 @@ later is required to fix a server side protocol bug.
 """
 
   def _Options(self, p, show_smart=True):
+    self.jobs = self.manifest.default.sync_j
+
     p.add_option('-f', '--force-broken',
                  dest='force_broken', action='store_true',
                  help="continue sync even if a project fails to sync")
@@ -116,16 +131,22 @@ later is required to fix a server side protocol bug.
     p.add_option('-d','--detach',
                  dest='detach_head', action='store_true',
                  help='detach projects back to manifest revision')
+    p.add_option('-c','--current-branch',
+                 dest='current_branch_only', action='store_true',
+                 help='fetch only current branch from server')
     p.add_option('-q','--quiet',
                  dest='quiet', action='store_true',
                  help='be more quiet')
     p.add_option('-j','--jobs',
                  dest='jobs', action='store', type='int',
-                 help="number of projects to fetch simultaneously")
+                 help="projects to fetch simultaneously (default %d)" % self.jobs)
     if show_smart:
       p.add_option('-s', '--smart-sync',
                    dest='smart_sync', action='store_true',
                    help='smart sync using manifest from a known good build')
+      p.add_option('-t', '--smart-tag',
+                   dest='smart_tag', action='store',
+                   help='smart sync using manifest from a known tag')
 
     g = p.add_option_group('repo Version options')
     g.add_option('--no-repo-verify',
@@ -135,20 +156,58 @@ later is required to fix a server side protocol bug.
                  dest='repo_upgraded', action='store_true',
                  help=SUPPRESS_HELP)
 
-  def _FetchHelper(self, opt, project, lock, fetched, pm, sem):
-      if not project.Sync_NetworkHalf(quiet=opt.quiet):
-        print >>sys.stderr, 'error: Cannot fetch %s' % project.name
-        if opt.force_broken:
-          print >>sys.stderr, 'warn: --force-broken, continuing to sync'
-        else:
-          sem.release()
-          sys.exit(1)
+  def _FetchHelper(self, opt, project, lock, fetched, pm, sem, err_event):
+      """Main function of the fetch threads when jobs are > 1.
 
-      lock.acquire()
-      fetched.add(project.gitdir)
-      pm.update()
-      lock.release()
-      sem.release()
+      Args:
+        opt: Program options returned from optparse.  See _Options().
+        project: Project object for the project to fetch.
+        lock: Lock for accessing objects that are shared amongst multiple
+            _FetchHelper() threads.
+        fetched: set object that we will add project.gitdir to when we're done
+            (with our lock held).
+        pm: Instance of a Project object.  We will call pm.update() (with our
+            lock held).
+        sem: We'll release() this semaphore when we exit so that another thread
+            can be started up.
+        err_event: We'll set this event in the case of an error (after printing
+            out info about the error).
+      """
+      # We'll set to true once we've locked the lock.
+      did_lock = False
+
+      # Encapsulate everything in a try/except/finally so that:
+      # - We always set err_event in the case of an exception.
+      # - We always make sure we call sem.release().
+      # - We always make sure we unlock the lock if we locked it.
+      try:
+        try:
+          success = project.Sync_NetworkHalf(quiet=opt.quiet,
+                                             current_branch_only=opt.current_branch_only)
+
+          # Lock around all the rest of the code, since printing, updating a set
+          # and Progress.update() are not thread safe.
+          lock.acquire()
+          did_lock = True
+
+          if not success:
+            print >>sys.stderr, 'error: Cannot fetch %s' % project.name
+            if opt.force_broken:
+              print >>sys.stderr, 'warn: --force-broken, continuing to sync'
+            else:
+              raise _FetchError()
+
+          fetched.add(project.gitdir)
+          pm.update()
+        except _FetchError:
+          err_event.set()
+        except:
+          err_event.set()
+          raise
+      finally:
+        if did_lock:
+          lock.release()
+        sem.release()
 
   def _Fetch(self, projects, opt):
     fetched = set()
@@ -157,7 +216,8 @@ later is required to fix a server side protocol bug.
     if self.jobs == 1:
       for project in projects:
         pm.update()
-        if project.Sync_NetworkHalf(quiet=opt.quiet):
+        if project.Sync_NetworkHalf(quiet=opt.quiet,
+                                    current_branch_only=opt.current_branch_only):
           fetched.add(project.gitdir)
         else:
           print >>sys.stderr, 'error: Cannot fetch %s' % project.name
@@ -169,7 +229,13 @@ later is required to fix a server side protocol bug.
       threads = set()
       lock = _threading.Lock()
       sem = _threading.Semaphore(self.jobs)
+      err_event = _threading.Event()
       for project in projects:
+        # Check for any errors before starting any new threads.
+        # ...we'll let existing threads finish, though.
+        if err_event.isSet():
+          break
+
         sem.acquire()
         t = _threading.Thread(target = self._FetchHelper,
                               args = (opt,
@@ -177,12 +243,18 @@ later is required to fix a server side protocol bug.
                                       lock,
                                       fetched,
                                       pm,
-                                      sem))
+                                      sem,
+                                      err_event))
         threads.add(t)
         t.start()
 
       for t in threads:
         t.join()
+
+      # If we saw an error, exit with code 1 so that other scripts can check.
+      if err_event.isSet():
+        print >>sys.stderr, '\nerror: Exited sync due to fetch errors'
+        sys.exit(1)
 
     pm.end()
     for project in projects:
@@ -251,6 +323,10 @@ uncommitted changes are present' % project.relpath
   def Execute(self, opt, args):
     if opt.jobs:
       self.jobs = opt.jobs
+    if self.jobs > 1:
+      soft_limit, _ = _rlimit_nofile()
+      self.jobs = min(self.jobs, (soft_limit - 5) / 3)
+
     if opt.network_only and opt.detach_head:
       print >>sys.stderr, 'error: cannot combine -n and -d'
       sys.exit(1)
@@ -258,27 +334,31 @@ uncommitted changes are present' % project.relpath
       print >>sys.stderr, 'error: cannot combine -n and -l'
       sys.exit(1)
 
-    if opt.smart_sync:
+    if opt.smart_sync or opt.smart_tag:
       if not self.manifest.manifest_server:
         print >>sys.stderr, \
             'error: cannot smart sync: no manifest server defined in manifest'
         sys.exit(1)
       try:
         server = xmlrpclib.Server(self.manifest.manifest_server)
-        p = self.manifest.manifestProject
-        b = p.GetBranch(p.CurrentBranch)
-        branch = b.merge
-        if branch.startswith(R_HEADS):
-          branch = branch[len(R_HEADS):]
+        if opt.smart_sync:
+          p = self.manifest.manifestProject
+          b = p.GetBranch(p.CurrentBranch)
+          branch = b.merge
+          if branch.startswith(R_HEADS):
+            branch = branch[len(R_HEADS):]
 
-        env = os.environ.copy()
-        if (env.has_key('TARGET_PRODUCT') and
-            env.has_key('TARGET_BUILD_VARIANT')):
-          target = '%s-%s' % (env['TARGET_PRODUCT'],
-                              env['TARGET_BUILD_VARIANT'])
-          [success, manifest_str] = server.GetApprovedManifest(branch, target)
+          env = os.environ.copy()
+          if (env.has_key('TARGET_PRODUCT') and
+              env.has_key('TARGET_BUILD_VARIANT')):
+            target = '%s-%s' % (env['TARGET_PRODUCT'],
+                                env['TARGET_BUILD_VARIANT'])
+            [success, manifest_str] = server.GetApprovedManifest(branch, target)
+          else:
+            [success, manifest_str] = server.GetApprovedManifest(branch)
         else:
-          [success, manifest_str] = server.GetApprovedManifest(branch)
+          assert(opt.smart_tag)
+          [success, manifest_str] = server.GetManifest(opt.smart_tag)
 
         if success:
           manifest_name = "smart_sync_override.xml"
@@ -313,7 +393,8 @@ uncommitted changes are present' % project.relpath
       _PostRepoUpgrade(self.manifest)
 
     if not opt.local_only:
-      mp.Sync_NetworkHalf(quiet=opt.quiet)
+      mp.Sync_NetworkHalf(quiet=opt.quiet,
+                          current_branch_only=opt.current_branch_only)
 
     if mp.HasChanges:
       syncbuf = SyncBuffer(mp.config)
@@ -321,6 +402,8 @@ uncommitted changes are present' % project.relpath
       if not syncbuf.Finish():
         sys.exit(1)
       self.manifest._Unload()
+      if opt.jobs is None:
+        self.jobs = self.manifest.default.sync_j
     all = self.GetProjects(args, missing_ok=True)
 
     if not opt.local_only:
@@ -401,7 +484,7 @@ def _PostRepoFetch(rp, no_repo_verify=False, verbose=False):
       print >>sys.stderr, 'warning: Skipped upgrade to unverified version'
   else:
     if verbose:
-      print >>sys.stderr, 'repo version %s is current' % rp.work_git.describe(HEAD)
+      print >>sys.stderr, 'repo version %s is current' % rp.work_git.rev_parse(HEAD)
 
 def _VerifyTag(project):
   gpg_dir = os.path.expanduser('~/.repoconfig/gnupg')

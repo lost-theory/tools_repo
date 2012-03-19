@@ -14,16 +14,15 @@
 # limitations under the License.
 
 import os
+import shutil
 import sys
 
 from color import Coloring
 from command import InteractiveCommand, MirrorSafeCommand
 from error import ManifestParseError
 from project import SyncBuffer
+from git_config import GitConfig
 from git_command import git_require, MIN_GIT_VERSION
-from manifest_submodule import SubmoduleManifest
-from manifest_xml import XmlManifest
-from subcmds.sync import _ReloadManifest
 
 class Init(InteractiveCommand, MirrorSafeCommand):
   common = True
@@ -75,21 +74,18 @@ to update the working directory files.
     g.add_option('-b', '--manifest-branch',
                  dest='manifest_branch',
                  help='manifest branch or revision', metavar='REVISION')
-    g.add_option('-o', '--origin',
-                 dest='manifest_origin',
-                 help="use REMOTE instead of 'origin' to track upstream",
-                 metavar='REMOTE')
-    if isinstance(self.manifest, XmlManifest) \
-    or not self.manifest.manifestProject.Exists:
-      g.add_option('-m', '--manifest-name',
-                   dest='manifest_name', default='default.xml',
-                   help='initial manifest file', metavar='NAME.xml')
+    g.add_option('-m', '--manifest-name',
+                 dest='manifest_name', default='default.xml',
+                 help='initial manifest file', metavar='NAME.xml')
     g.add_option('--mirror',
                  dest='mirror', action='store_true',
                  help='mirror the forrest')
     g.add_option('--reference',
                  dest='reference',
                  help='location of mirror directory', metavar='DIR')
+    g.add_option('--depth', type='int', default=None,
+                 dest='depth',
+                 help='create a shallow clone with given depth; see git clone')
 
     # Tool
     g = p.add_option_group('repo Version options')
@@ -103,26 +99,11 @@ to update the working directory files.
                  dest='no_repo_verify', action='store_true',
                  help='do not verify repo source code')
 
-  def _ApplyOptions(self, opt, is_new):
-    m = self.manifest.manifestProject
-
-    if is_new:
-      if opt.manifest_origin:
-        m.remote.name = opt.manifest_origin
-
-      if opt.manifest_branch:
-        m.revisionExpr = opt.manifest_branch
-      else:
-        m.revisionExpr = 'refs/heads/master'
-    else:
-      if opt.manifest_origin:
-        print >>sys.stderr, 'fatal: cannot change origin name'
-        sys.exit(1)
-
-      if opt.manifest_branch:
-        m.revisionExpr = opt.manifest_branch
-      else:
-        m.PreSync()
+    # Other
+    g = p.add_option_group('Other options')
+    g.add_option('--config-name',
+                 dest='config_name', action="store_true", default=False,
+                 help='Always prompt for name/e-mail')
 
   def _SyncManifest(self, opt):
     m = self.manifest.manifestProject
@@ -134,11 +115,20 @@ to update the working directory files.
         sys.exit(1)
 
       if not opt.quiet:
-        print >>sys.stderr, 'Getting manifest ...'
-        print >>sys.stderr, '   from %s' % opt.manifest_url
+        print >>sys.stderr, 'Get %s' \
+          % GitConfig.ForUser().UrlInsteadOf(opt.manifest_url)
       m._InitGitDir()
 
-    self._ApplyOptions(opt, is_new)
+      if opt.manifest_branch:
+        m.revisionExpr = opt.manifest_branch
+      else:
+        m.revisionExpr = 'refs/heads/master'
+    else:
+      if opt.manifest_branch:
+        m.revisionExpr = opt.manifest_branch
+      else:
+        m.PreSync()
+
     if opt.manifest_url:
       r = m.GetRemote(m.remote.name)
       r.url = opt.manifest_url
@@ -151,43 +141,28 @@ to update the working directory files.
     if opt.mirror:
       if is_new:
         m.config.SetString('repo.mirror', 'true')
-        m.config.ClearCache()
       else:
         print >>sys.stderr, 'fatal: --mirror not supported on existing client'
         sys.exit(1)
 
-    if not m.Sync_NetworkHalf():
+    if not m.Sync_NetworkHalf(is_new=is_new):
       r = m.GetRemote(m.remote.name)
       print >>sys.stderr, 'fatal: cannot obtain manifest %s' % r.url
+
+      # Better delete the manifest git dir if we created it; otherwise next
+      # time (when user fixes problems) we won't go through the "is_new" logic.
+      if is_new:
+        shutil.rmtree(m.gitdir)
       sys.exit(1)
-
-    if is_new and SubmoduleManifest.IsBare(m):
-      new = self.GetManifest(reparse=True, type=SubmoduleManifest)
-      if m.gitdir != new.manifestProject.gitdir:
-        os.rename(m.gitdir, new.manifestProject.gitdir)
-        new = self.GetManifest(reparse=True, type=SubmoduleManifest)
-      m = new.manifestProject
-      self._ApplyOptions(opt, is_new)
-
-    if not is_new:
-      # Force the manifest to load if it exists, the old graph
-      # may be needed inside of _ReloadManifest().
-      #
-      self.manifest.projects
 
     syncbuf = SyncBuffer(m.config)
     m.Sync_LocalHalf(syncbuf)
     syncbuf.Finish()
 
-    if isinstance(self.manifest, XmlManifest):
-      self._LinkManifest(opt.manifest_name)
-    _ReloadManifest(self)
-
-    self._ApplyOptions(opt, is_new)
-
-    if not self.manifest.InitBranch():
-      print >>sys.stderr, 'fatal: cannot create branch in manifest'
-      sys.exit(1)
+    if is_new or m.CurrentBranch is None:
+      if not m.StartBranch('default'):
+        print >>sys.stderr, 'fatal: cannot create default in manifest'
+        sys.exit(1)
 
   def _LinkManifest(self, name):
     if not name:
@@ -210,6 +185,24 @@ to update the working directory files.
       return value
     return a
 
+  def _ShouldConfigureUser(self):
+    gc = self.manifest.globalConfig
+    mp = self.manifest.manifestProject
+
+    # If we don't have local settings, get from global.
+    if not mp.config.Has('user.name') or not mp.config.Has('user.email'):
+      if not gc.Has('user.name') or not gc.Has('user.email'):
+        return True
+
+      mp.config.SetString('user.name', gc.GetString('user.name'))
+      mp.config.SetString('user.email', gc.GetString('user.email'))
+
+    print ''
+    print 'Your identity is: %s <%s>' % (mp.config.GetString('user.name'),
+                                         mp.config.GetString('user.email'))
+    print 'If you want to change this, please re-run \'repo init\' with --config-name'
+    return False
+
   def _ConfigureUser(self):
     mp = self.manifest.manifestProject
 
@@ -220,7 +213,7 @@ to update the working directory files.
 
       print ''
       print 'Your identity is: %s <%s>' % (name, email)
-      sys.stdout.write('is this correct [y/n]? ')
+      sys.stdout.write('is this correct [y/N]? ')
       a = sys.stdin.readline().strip()
       if a in ('yes', 'y', 't', 'true'):
         break
@@ -262,18 +255,41 @@ to update the working directory files.
       out.printer(fg='black', attr=c)(' %-6s ', c)
     out.nl()
 
-    sys.stdout.write('Enable color display in this user account (y/n)? ')
+    sys.stdout.write('Enable color display in this user account (y/N)? ')
     a = sys.stdin.readline().strip().lower()
     if a in ('y', 'yes', 't', 'true', 'on'):
       gc.SetString('color.ui', 'auto')
 
+  def _ConfigureDepth(self, opt):
+    """Configure the depth we'll sync down.
+
+    Args:
+      opt: Options from optparse.  We care about opt.depth.
+    """
+    # Opt.depth will be non-None if user actually passed --depth to repo init.
+    if opt.depth is not None:
+      if opt.depth > 0:
+        # Positive values will set the depth.
+        depth = str(opt.depth)
+      else:
+        # Negative numbers will clear the depth; passing None to SetString
+        # will do that.
+        depth = None
+
+      # We store the depth in the main manifest project.
+      self.manifest.manifestProject.config.SetString('repo.depth', depth)
+
   def Execute(self, opt, args):
     git_require(MIN_GIT_VERSION, fail=True)
     self._SyncManifest(opt)
+    self._LinkManifest(opt.manifest_name)
 
     if os.isatty(0) and os.isatty(1) and not self.manifest.IsMirror:
-      self._ConfigureUser()
+      if opt.config_name or self._ShouldConfigureUser():
+        self._ConfigureUser()
       self._ConfigureColor()
+
+    self._ConfigureDepth(opt)
 
     if self.manifest.IsMirror:
       type = 'mirror '

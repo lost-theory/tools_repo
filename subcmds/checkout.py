@@ -38,21 +38,44 @@ The command is equivalent to:
 
     nb = args[0]
     err = []
+    success = []
     all = self.GetProjects(args[1:])
 
     pm = Progress('Checkout %s' % nb, len(all))
     for project in all:
       pm.update()
-      if not project.CheckoutBranch(nb):
-        err.append(project)
+
+      status = project.CheckoutBranch(nb)
+      if status is not None:
+        if status:
+          success.append(project)
+        else:
+          err.append(project)
     pm.end()
 
     if err:
-      if len(err) == len(all):
-        print >>sys.stderr, 'error: no project has branch %s' % nb
-      else:
-        for p in err:
-          print >>sys.stderr,\
-            "error: %s/: cannot checkout %s" \
-            % (p.relpath, nb)
+      for p in err:
+        print >>sys.stderr,\
+          "error: %s/: cannot checkout %s" \
+          % (p.relpath, nb)
       sys.exit(1)
+    elif not success or len(success) != len(all):
+      #branch does not exist locally, check all remotes
+      print >>sys.stderr, "note: no project has local branch '%s', searching remotes..." % nb
+      for project in all:
+        rbranches = project.work_git.branch("-r")
+        rbranches = rbranches.strip().split('\n')
+        rbranches = map(lambda s: s.split('->')[0].strip(), rbranches)
+        rbranches = [b.replace('origin/', '') for b in rbranches if b.startswith('origin/')]
+        if nb not in rbranches:
+          #remote branch doesn't exist for this repo, quit with error message
+          print >>sys.stderr, "error: remote branch '%s' does not exist on '%s', can't complete checkout" % (nb, project.name)
+          sys.exit(1)
+
+      #branch exists on all remotes, run checkout everywhere
+      print >>sys.stderr, "note: remote branches all exist! checking out now"
+      for project in all:
+        print >>sys.stdout, "%s:" % project.name
+        out = project.work_git.checkout(nb)
+        print >>sys.stdout, out
+        print >>sys.stdout
